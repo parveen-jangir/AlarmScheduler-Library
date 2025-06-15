@@ -235,9 +235,11 @@ void CallbackAlarms::listAlarms(JsonArray& arr) {
 
 // AlarmScheduler Implementation
 AlarmScheduler::AlarmScheduler() : callbacks{CallbackAlarms(1), CallbackAlarms(2), CallbackAlarms(3), CallbackAlarms(4)},
-                                  rtc(nullptr), wire(nullptr), lastSyncMillis(0) {}
+                                  rtc(nullptr), wire(nullptr), ntpUDP(nullptr), timeClient(nullptr), lastSyncMillis(0) {}
 
 AlarmScheduler::~AlarmScheduler() {
+  delete timeClient;
+  delete ntpUDP;
   delete rtc;
   delete wire;
 }
@@ -246,12 +248,18 @@ void AlarmScheduler::begin(uint8_t rstPin, uint8_t datPin, uint8_t clkPin) {
   wire = new ThreeWire(datPin, clkPin, rstPin);
   rtc = new RtcDS1302<ThreeWire>(*wire);
   rtc->Begin();
+  
+  // Initialize NTP client components
+  ntpUDP = new WiFiUDP();
+  timeClient = new NTPClient(*ntpUDP, "pool.ntp.org", 19800, 60000); // IST timezone (UTC+5:30)
+  
   if (rtc->GetIsRunning()) {
     Serial.println("DS1302 initialized and running.");
   } else {
     Serial.println("DS1302 detected but not running. Set time using 'set' command.");
     rtc->SetIsRunning(true);
   }
+  
   // Initial sync
   time_t rtcTime = getRtcTime();
   if (rtcTime > 0) setTime(rtcTime);
@@ -269,6 +277,71 @@ time_t AlarmScheduler::getRtcTime() {
     return now.TotalSeconds() + 946684800L; // Unix time (2000 to 1970 offset)
   }
   return 0;
+}
+
+bool AlarmScheduler::setRTCFromNTP() {
+  if (WiFi.status() != WL_CONNECTED) {
+    return false;
+  }
+  
+  if (!timeClient) return false;
+  
+  if (!timeClient->update()) {
+    return false;
+  }
+  
+  unsigned long epochTime = timeClient->getEpochTime();
+  
+  // Validate epoch time (must be after 2025 and before 2100)
+  if (epochTime < 1735689600 || epochTime > 4102444800) {
+    Serial.println("Invalid NTP time received. Skipping RTC update.");
+    return false;
+  }
+  
+  // Convert epoch time to RtcDateTime
+  time_t t = epochTime;
+  struct tm *timeInfo = gmtime(&t);
+  RtcDateTime ntpTime = RtcDateTime(
+    timeInfo->tm_year + 1900,
+    timeInfo->tm_mon + 1,
+    timeInfo->tm_mday,
+    timeInfo->tm_hour,
+    timeInfo->tm_min,
+    timeInfo->tm_sec
+  );
+  
+  // Set RTC
+  rtc->SetDateTime(ntpTime);
+  
+  // Update TimeLib as well
+  setTime(epochTime);
+  
+  if (rtc->IsDateTimeValid()) {
+    Serial.println("RTC time set from NTP successfully!");
+    return true;
+  } else {
+    Serial.println("Failed to set RTC time from NTP.");
+    return false;
+  }
+}
+
+bool AlarmScheduler::syncWithNTP() {
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("No Wi-Fi connection. Cannot sync with NTP.");
+    return false;
+  }
+  
+  if (!timeClient) return false;
+  
+  // Begin NTP client if not already started
+  timeClient->begin();
+  
+  bool success = setRTCFromNTP();
+  
+  // End NTP client to free resources
+  timeClient->end();
+  
+  return success;
 }
 
 void AlarmScheduler::processJson(String& json) {
@@ -301,6 +374,23 @@ void AlarmScheduler::processJson(String& json) {
       doc.clear();
       doc["status"] = "error";
       doc["message"] = "Invalid time format. Use YYYY-MM-DD HH:MM[:SS]";
+    }
+    serializeJson(doc, Serial);
+    Serial.println();
+  } else if (command == "ntp") {
+    bool success = syncWithNTP();
+    doc.clear();
+    doc["command"] = "ntp";
+    doc["status"] = success ? "success" : "error";
+    if (!success) {
+      if (WiFi.status() != WL_CONNECTED) {
+        doc["message"] = "No Wi-Fi connection";
+      } else {
+        doc["message"] = "NTP sync failed";
+      }
+    } else {
+      doc["message"] = "RTC synced with NTP (IST)";
+      doc["time"] = printTime();
     }
     serializeJson(doc, Serial);
     Serial.println();
@@ -379,6 +469,10 @@ String AlarmScheduler::printTime() {
   if (!rtc) return "RTC not initialized!";
   RtcDateTime now = rtc->GetDateTime();
   if (now.IsValid()) {
+    // Validate year to catch garbage values
+    if (now.Year() < 2025 || now.Year() > 2099) {
+      return "Invalid RTC year: " + String(now.Year()) + ". RTC may need reset.";
+    }
     char dateTimeString[20];
     snprintf(dateTimeString, sizeof(dateTimeString), "%04u/%02u/%02u %02u:%02u:%02u",
              now.Year(), now.Month(), now.Day(), now.Hour(), now.Minute(), now.Second());

@@ -5,6 +5,9 @@
 #include <RtcDS1302.h>
 #include <TimeLib.h>
 #include <ArduinoJson.h>
+#include <WiFi.h>
+#include <NTPClient.h>
+#include <WiFiUdp.h>
 
 class CallbackAlarms {
 private:
@@ -40,8 +43,11 @@ private:
   CallbackAlarms callbacks[4]; // IDs 1–4
   RtcDS1302<ThreeWire>* rtc;   // Pointer to RTC
   ThreeWire* wire;             // Pointer to ThreeWire
+  WiFiUDP* ntpUDP;             // Pointer to NTP UDP
+  NTPClient* timeClient;       // Pointer to NTP client
   time_t getRtcTime();
   unsigned long lastSyncMillis; // For manual sync
+  bool setRTCFromNTP();        // NTP sync function
 
 public:
   AlarmScheduler();
@@ -52,6 +58,7 @@ public:
   void checkAlarms();
   String printTime();
   bool isTimeSet();
+  bool syncWithNTP();          // Public NTP sync function
 };
 
 #endif

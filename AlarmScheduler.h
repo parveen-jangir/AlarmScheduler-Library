@@ -8,6 +8,7 @@
 #include <WiFi.h>
 #include <NTPClient.h>
 #include <WiFiUdp.h>
+#include <SPIFFS.h>
 
 class CallbackAlarms {
 private:
@@ -33,9 +34,10 @@ public:
   CallbackAlarms(uint8_t id);
   bool addAlarm(JsonDocument& doc);
   bool deleteAlarm(uint8_t id);
-  void checkAlarms();
+  bool checkAlarms(); // Modified to return bool indicating state change
   void listAlarms(JsonArray& arr);
   void setCallback(void (*callback)(int id, bool isOn)) { Callback = callback; }
+  void clearAlarms();
 };
 
 class AlarmScheduler {
@@ -48,9 +50,11 @@ private:
   time_t getRtcTime();
   unsigned long lastSyncMillis; // For manual sync
   bool setRTCFromNTP();        // NTP sync function
+  unsigned long offset;
+  bool spiffsInitialized;      // Track SPIFFS initialization
 
 public:
-  AlarmScheduler();
+  AlarmScheduler(unsigned long timeOffset = 19800);
   ~AlarmScheduler();
   void begin(uint8_t rstPin, uint8_t datPin, uint8_t clkPin);
   void registerCallback(uint8_t id, void (*callback)(int id, bool isOn));
@@ -58,7 +62,10 @@ public:
   void checkAlarms();
   String printTime();
   bool isTimeSet();
-  bool syncWithNTP();          // Public NTP sync function
+  bool syncWithNTP();
+  void updateOffsetValue(unsigned long offset);
+  bool saveAlarmsToSpiffs();
+  bool loadAlarmsFromSpiffs();
 };
 
 #endif

@@ -154,11 +154,12 @@ bool CallbackAlarms::deleteAlarm(uint8_t id) {
   return true;
 }
 
-void CallbackAlarms::checkAlarms() {
-  if (timeStatus() != timeSet || !Callback) return;
+bool CallbackAlarms::checkAlarms() {
+  if (timeStatus() != timeSet || !Callback) return false;
   unsigned long currentMinute = now() / 60;
-  if (currentMinute == lastTriggerMinute) return;
+  if (currentMinute == lastTriggerMinute) return false;
 
+  bool stateChanged = false;
   bool dateTriggered = false;
   // Check date-based alarms first
   for (int i = 0; i < 10; i++) {
@@ -177,6 +178,7 @@ void CallbackAlarms::checkAlarms() {
       if (alarms[i].isOneTime) {
         alarms[i].isActive = false;
         alarmCount--;
+        stateChanged = true;
       }
       char timeStr[20];
       snprintf(timeStr, sizeof(timeStr), "%04d/%02d/%02d %02d:%02d:%02d",
@@ -202,6 +204,7 @@ void CallbackAlarms::checkAlarms() {
   }
 
   lastTriggerMinute = currentMinute;
+  return stateChanged;
 }
 
 void CallbackAlarms::listAlarms(JsonArray& arr) {
@@ -233,15 +236,37 @@ void CallbackAlarms::listAlarms(JsonArray& arr) {
   }
 }
 
+void CallbackAlarms::clearAlarms() {
+  for (int i = 0; i < 10; i++) {
+    alarms[i].isActive = false;
+    alarms[i].isDateBased = false;
+    alarms[i].isOneTime = false;
+    for (int j = 0; j < 7; j++) alarms[i].days[j] = false;
+    alarms[i].year = 0;
+    alarms[i].month = 0;
+    alarms[i].date = 0;
+    alarms[i].hour = 0;
+    alarms[i].minute = 0;
+    alarms[i].action = false;
+  }
+  alarmCount = 0;
+}
+
 // AlarmScheduler Implementation
-AlarmScheduler::AlarmScheduler() : callbacks{CallbackAlarms(1), CallbackAlarms(2), CallbackAlarms(3), CallbackAlarms(4)},
-                                  rtc(nullptr), wire(nullptr), ntpUDP(nullptr), timeClient(nullptr), lastSyncMillis(0) {}
+AlarmScheduler::AlarmScheduler(unsigned long timeOffset) : callbacks{CallbackAlarms(1), CallbackAlarms(2), CallbackAlarms(3), CallbackAlarms(4)},
+                                  rtc(nullptr), wire(nullptr), ntpUDP(nullptr), timeClient(nullptr), lastSyncMillis(0), offset(timeOffset), spiffsInitialized(false) {}
 
 AlarmScheduler::~AlarmScheduler() {
   delete timeClient;
   delete ntpUDP;
   delete rtc;
   delete wire;
+}
+
+void AlarmScheduler::updateOffsetValue(unsigned long _offset){
+  offset = _offset;
+  timeClient->setTimeOffset(_offset);
+  setRTCFromNTP();
 }
 
 void AlarmScheduler::begin(uint8_t rstPin, uint8_t datPin, uint8_t clkPin) {
@@ -251,7 +276,15 @@ void AlarmScheduler::begin(uint8_t rstPin, uint8_t datPin, uint8_t clkPin) {
   
   // Initialize NTP client components
   ntpUDP = new WiFiUDP();
-  timeClient = new NTPClient(*ntpUDP, "pool.ntp.org", 19800, 60000); // IST timezone (UTC+5:30)
+  timeClient = new NTPClient(*ntpUDP, "pool.ntp.org", offset, 86400000);
+  
+  // Initialize SPIFFS
+  spiffsInitialized = SPIFFS.begin(true); // Format on failure
+  if (!spiffsInitialized) {
+    Serial.println("Failed to initialize SPIFFS");
+  } else {
+    Serial.println("SPIFFS initialized successfully");
+  }
   
   if (rtc->GetIsRunning()) {
     Serial.println("DS1302 initialized and running.");
@@ -263,6 +296,15 @@ void AlarmScheduler::begin(uint8_t rstPin, uint8_t datPin, uint8_t clkPin) {
   // Initial sync
   time_t rtcTime = getRtcTime();
   if (rtcTime > 0) setTime(rtcTime);
+  
+  // Load alarms from SPIFFS
+  if (spiffsInitialized) {
+    if (!loadAlarmsFromSpiffs()) {
+      Serial.println("Failed to load alarms from SPIFFS");
+    } else {
+      Serial.println("Alarms loaded from SPIFFS successfully");
+    }
+  }
 }
 
 void AlarmScheduler::registerCallback(uint8_t id, void (*callback)(int id, bool isOn)) {
@@ -344,6 +386,110 @@ bool AlarmScheduler::syncWithNTP() {
   return success;
 }
 
+bool AlarmScheduler::saveAlarmsToSpiffs() {
+  if (!spiffsInitialized) {
+    StaticJsonDocument<128> response;
+    response["status"] = "error";
+    response["message"] = "SPIFFS not initialized";
+    serializeJson(response, Serial);
+    Serial.println();
+    return false;
+  }
+
+  DynamicJsonDocument doc(4096); // Large enough for 40 alarms
+  JsonArray alarms = doc.createNestedArray("alarms");
+  for (int i = 0; i < 4; i++) {
+    callbacks[i].listAlarms(alarms);
+  }
+
+  File file = SPIFFS.open("/alarms.json", FILE_WRITE);
+  if (!file) {
+    StaticJsonDocument<128> response;
+    response["status"] = "error";
+    response["message"] = "Failed to open alarms.json for writing";
+    serializeJson(response, Serial);
+    Serial.println();
+    return false;
+  }
+
+  if (serializeJson(doc, file) == 0) {
+    file.close();
+    StaticJsonDocument<128> response;
+    response["status"] = "error";
+    response["message"] = "Failed to write to alarms.json";
+    serializeJson(response, Serial);
+    Serial.println();
+    return false;
+  }
+
+  file.close();
+  return true;
+}
+
+bool AlarmScheduler::loadAlarmsFromSpiffs() {
+  if (!spiffsInitialized) {
+    StaticJsonDocument<128> response;
+    response["status"] = "error";
+    response["message"] = "SPIFFS not initialized";
+    serializeJson(response, Serial);
+    Serial.println();
+    return false;
+  }
+
+  File file = SPIFFS.open("/alarms.json", FILE_READ);
+  if (!file) {
+    StaticJsonDocument<128> response;
+    response["status"] = "error";
+    response["message"] = "No alarms.json file found";
+    serializeJson(response, Serial);
+    Serial.println();
+    return false;
+  }
+
+  DynamicJsonDocument doc(4096); // Large enough for 40 alarms
+  DeserializationError error = deserializeJson(doc, file);
+  file.close();
+
+  if (error) {
+    StaticJsonDocument<128> response;
+    response["status"] = "error";
+    response["message"] = "Invalid JSON in alarms.json";
+    serializeJson(response, Serial);
+    Serial.println();
+    return false;
+  }
+
+  // Clear existing alarms
+  for (int i = 0; i < 4; i++) {
+    callbacks[i].clearAlarms();
+  }
+
+  JsonArray alarms = doc["alarms"].as<JsonArray>();
+  bool success = true;
+  for (JsonObject alarm : alarms) {
+    DynamicJsonDocument alarmDoc(512);
+    for (JsonPair pair : alarm) {
+      alarmDoc[pair.key()] = pair.value();
+    }
+    alarmDoc["command"] = "add";
+    int callbackId = alarm["callback"].as<int>();
+    if (callbackId < 1 || callbackId > 4) {
+      StaticJsonDocument<128> response;
+      response["status"] = "error";
+      response["message"] = "Invalid callback ID in alarms.json: " + String(callbackId);
+      serializeJson(response, Serial);
+      Serial.println();
+      success = false;
+      continue;
+    }
+    if (!callbacks[callbackId - 1].addAlarm(alarmDoc)) {
+      success = false;
+    }
+  }
+
+  return success;
+}
+
 void AlarmScheduler::processJson(String& json) {
   StaticJsonDocument<768> doc;
   DeserializationError error = deserializeJson(doc, json);
@@ -357,6 +503,8 @@ void AlarmScheduler::processJson(String& json) {
   }
 
   String command = doc["command"].as<String>();
+  bool saveToSpiffs = false;
+
   if (command == "set") {
     String timeStr = doc["time"].as<String>();
     int year, month, date, hour, minute, second = 0;
@@ -412,6 +560,7 @@ void AlarmScheduler::processJson(String& json) {
     }
     serializeJson(doc, Serial);
     Serial.println();
+    if (success) saveToSpiffs = true;
   } else if (command == "delete") {
     int callbackId = doc["callback"].as<int>();
     int id = doc["id"].as<int>();
@@ -429,6 +578,7 @@ void AlarmScheduler::processJson(String& json) {
     if (!success) doc["message"] = "Invalid ID";
     serializeJson(doc, Serial);
     Serial.println();
+    if (success) saveToSpiffs = true;
   } else if (command == "list") {
     doc.clear();
     doc["command"] = "list";
@@ -451,17 +601,35 @@ void AlarmScheduler::processJson(String& json) {
     serializeJson(response, Serial);
     Serial.println();
   }
+
+  if (saveToSpiffs) {
+    if (!saveAlarmsToSpiffs()) {
+      Serial.println("Failed to save alarms to SPIFFS after command");
+    } else {
+      Serial.println("Alarms saved to SPIFFS successfully");
+    }
+  }
 }
 
 void AlarmScheduler::checkAlarms() {
-  // Sync time every 5 minutes
-  if (millis() - lastSyncMillis >= 300000UL) {
+  // Sync time every 24 hours
+  if (millis() - lastSyncMillis >= 86400000UL) {
     time_t rtcTime = getRtcTime();
     if (rtcTime > 0) setTime(rtcTime);
     lastSyncMillis = millis();
   }
+  bool stateChanged = false;
   for (int i = 0; i < 4; i++) {
-    callbacks[i].checkAlarms();
+    if (callbacks[i].checkAlarms()) {
+      stateChanged = true;
+    }
+  }
+  if (stateChanged) {
+    if (!saveAlarmsToSpiffs()) {
+      Serial.println("Failed to save alarms to SPIFFS after state change");
+    } else {
+      Serial.println("Alarms saved to SPIFFS successfully after state change");
+    }
   }
 }
 

@@ -79,6 +79,32 @@ bool CallbackAlarms::addAlarm(JsonDocument& doc) {
     return false;
   }
 
+  // Validate zone_data
+  if (!doc.containsKey("zone_data")) {
+    doc.clear();
+    doc["status"] = "error";
+    doc["message"] = "zone_data required";
+    return false;
+  }
+  
+  JsonObject zoneDataObj = doc["zone_data"].as<JsonObject>();
+  if (zoneDataObj.isNull()) {
+    doc.clear();
+    doc["status"] = "error";
+    doc["message"] = "zone_data must be JSON object";
+    return false;
+  }
+  
+  // Check zone_data size (approximate)
+  String zoneDataStr;
+  serializeJson(zoneDataObj, zoneDataStr);
+  if (zoneDataStr.length() > 1000) {
+    doc.clear();
+    doc["status"] = "error";
+    doc["message"] = "zone_data too large (max 1000 bytes)";
+    return false;
+  }
+
   // Initialize alarm
   Alarm& alarm = alarms[slot];
   alarm.isActive = true;
@@ -141,6 +167,45 @@ bool CallbackAlarms::addAlarm(JsonDocument& doc) {
   }
 
   alarmCount++;
+
+  // Store zone_data in separate file
+  DynamicJsonDocument zoneDoc(8192);
+  File file = SPIFFS.open("/zone_data.json", FILE_READ);
+  JsonArray zoneDataArray;
+  if (file) {
+    DeserializationError error = deserializeJson(zoneDoc, file);
+    if (!error && zoneDoc.containsKey("zone_data")) {
+      zoneDataArray = zoneDoc["zone_data"].as<JsonArray>();
+    }
+    file.close();
+  }
+  if (zoneDataArray.isNull()) {
+    zoneDataArray = zoneDoc.createNestedArray("zone_data");
+  }
+  
+  // Add/update zone data entry
+  bool found = false;
+  for (JsonObject obj : zoneDataArray) {
+    if (obj["callback"].as<int>() == callbackId && obj["id"].as<int>() == slot) {
+      obj["zone_data"] = zoneDataObj;
+      found = true;
+      break;
+    }
+  }
+  if (!found) {
+    JsonObject newZoneEntry = zoneDataArray.createNestedObject();
+    newZoneEntry["callback"] = callbackId;
+    newZoneEntry["id"] = slot;
+    newZoneEntry["zone_data"] = zoneDataObj;
+  }
+  
+  // Save zone data
+  file = SPIFFS.open("/zone_data.json", FILE_WRITE);
+  if (file) {
+    serializeJson(zoneDoc, file);
+    file.close();
+  }
+
   doc.clear();
   doc["status"] = "success";
   doc["id"] = slot;
@@ -151,6 +216,39 @@ bool CallbackAlarms::deleteAlarm(uint8_t id) {
   if (id >= 10 || !alarms[id].isActive) return false;
   alarms[id].isActive = false;
   alarmCount--;
+  
+  // Delete corresponding zone data
+  File file = SPIFFS.open("/zone_data.json", FILE_READ);
+  if (file) {
+    DynamicJsonDocument doc(8192);
+    DeserializationError error = deserializeJson(doc, file);
+    file.close();
+    
+    if (!error && doc.containsKey("zone_data")) {
+      JsonArray zoneArray = doc["zone_data"].as<JsonArray>();
+      JsonArray newArray = doc.createNestedArray("new_zone_data");
+      
+      for (JsonObject obj : zoneArray) {
+        if (!(obj["callback"].as<int>() == callbackId && obj["id"].as<int>() == id)) {
+          JsonObject newObj = newArray.createNestedObject();
+          for (JsonPair pair : obj) {
+            newObj[pair.key()] = pair.value();
+          }
+        }
+      }
+      
+      doc.remove("zone_data");
+      doc["zone_data"] = newArray;
+      doc.remove("new_zone_data");
+      
+      file = SPIFFS.open("/zone_data.json", FILE_WRITE);
+      if (file) {
+        serializeJson(doc, file);
+        file.close();
+      }
+    }
+  }
+  
   return true;
 }
 
@@ -174,7 +272,30 @@ bool CallbackAlarms::checkAlarms() {
                  alarms[i].hour == hour() && alarms[i].minute == minute());
     }
     if (isMatch) {
-      Callback(callbackId, alarms[i].action);
+      // Load zone data for this alarm
+      DynamicJsonDocument zoneDoc(1200);
+      JsonObject zoneData = zoneDoc.to<JsonObject>();
+      
+      File file = SPIFFS.open("/zone_data.json", FILE_READ);
+      if (file) {
+        DynamicJsonDocument fileDoc(8192);
+        DeserializationError error = deserializeJson(fileDoc, file);
+        if (!error && fileDoc.containsKey("zone_data")) {
+          JsonArray zoneArray = fileDoc["zone_data"].as<JsonArray>();
+          for (JsonObject zoneObj : zoneArray) {
+            if (zoneObj["callback"].as<int>() == callbackId && zoneObj["id"].as<int>() == i) {
+              JsonObject srcZoneData = zoneObj["zone_data"].as<JsonObject>();
+              for (JsonPair pair : srcZoneData) {
+                zoneData[pair.key()] = pair.value();
+              }
+              break;
+            }
+          }
+        }
+        file.close();
+      }
+      
+      Callback(callbackId, alarms[i].action, zoneData);
       if (alarms[i].isOneTime) {
         alarms[i].isActive = false;
         alarmCount--;
@@ -194,7 +315,30 @@ bool CallbackAlarms::checkAlarms() {
       if (!alarms[i].isActive || alarms[i].isDateBased) continue;
       if (alarms[i].days[weekday() - 1] && alarms[i].hour == hour() &&
           alarms[i].minute == minute()) {
-        Callback(callbackId, alarms[i].action);
+        // Load zone data for this alarm
+        DynamicJsonDocument zoneDoc(1200);
+        JsonObject zoneData = zoneDoc.to<JsonObject>();
+        
+        File file = SPIFFS.open("/zone_data.json", FILE_READ);
+        if (file) {
+          DynamicJsonDocument fileDoc(8192);
+          DeserializationError error = deserializeJson(fileDoc, file);
+          if (!error && fileDoc.containsKey("zone_data")) {
+            JsonArray zoneArray = fileDoc["zone_data"].as<JsonArray>();
+            for (JsonObject zoneObj : zoneArray) {
+              if (zoneObj["callback"].as<int>() == callbackId && zoneObj["id"].as<int>() == i) {
+                JsonObject srcZoneData = zoneObj["zone_data"].as<JsonObject>();
+                for (JsonPair pair : srcZoneData) {
+                  zoneData[pair.key()] = pair.value();
+                }
+                break;
+              }
+            }
+          }
+          file.close();
+        }
+        
+        Callback(callbackId, alarms[i].action, zoneData);
         char timeStr[20];
         snprintf(timeStr, sizeof(timeStr), "%04d/%02d/%02d %02d:%02d:%02d",
                  year(), month(), day(), hour(), minute(), second());
@@ -218,6 +362,30 @@ void CallbackAlarms::listAlarms(JsonArray& arr) {
     snprintf(timeStr, sizeof(timeStr), "%02d:%02d", alarms[i].hour, alarms[i].minute);
     obj["time"] = timeStr;
     obj["action"] = alarms[i].action ? "ON" : "OFF";
+    
+    // Add zone_data to the output
+    DynamicJsonDocument zoneDoc(1200);
+    JsonObject zoneData = zoneDoc.to<JsonObject>();
+    File file = SPIFFS.open("/zone_data.json", FILE_READ);
+    if (file) {
+      DynamicJsonDocument fileDoc(8192);
+      DeserializationError error = deserializeJson(fileDoc, file);
+      if (!error && fileDoc.containsKey("zone_data")) {
+        JsonArray zoneArray = fileDoc["zone_data"].as<JsonArray>();
+        for (JsonObject zoneObj : zoneArray) {
+          if (zoneObj["callback"].as<int>() == callbackId && zoneObj["id"].as<int>() == i) {
+            JsonObject srcZoneData = zoneObj["zone_data"].as<JsonObject>();
+            for (JsonPair pair : srcZoneData) {
+              zoneData[pair.key()] = pair.value();
+            }
+            break;
+          }
+        }
+      }
+      file.close();
+    }
+    obj["zone_data"] = zoneData;
+    
     if (alarms[i].isDateBased) {
       char dateStr[11];
       snprintf(dateStr, sizeof(dateStr), "%04d-%02d-%02d", alarms[i].year, alarms[i].month, alarms[i].date);
@@ -307,7 +475,7 @@ void AlarmScheduler::begin(uint8_t rstPin, uint8_t datPin, uint8_t clkPin) {
   }
 }
 
-void AlarmScheduler::registerCallback(uint8_t id, void (*callback)(int id, bool isOn)) {
+void AlarmScheduler::registerCallback(uint8_t id, void (*callback)(int id, bool isOn, JsonObject& zoneData)) {
   if (id < 1 || id > 4) return;
   callbacks[id - 1].setCallback(callback);
 }
@@ -384,6 +552,128 @@ bool AlarmScheduler::syncWithNTP() {
   timeClient->end();
   
   return success;
+}
+
+bool AlarmScheduler::saveZoneDataToSpiffs() {
+  if (!spiffsInitialized) {
+    return false;
+  }
+
+  DynamicJsonDocument doc(8192); // Larger buffer for zone data
+  JsonArray zoneDataArray = doc.createNestedArray("zone_data");
+  
+  // Read existing zone data file if it exists
+  File file = SPIFFS.open("/zone_data.json", FILE_READ);
+  if (file) {
+    DynamicJsonDocument existingDoc(8192);
+    DeserializationError error = deserializeJson(existingDoc, file);
+    if (!error && existingDoc.containsKey("zone_data")) {
+      JsonArray existing = existingDoc["zone_data"].as<JsonArray>();
+      for (JsonObject obj : existing) {
+        JsonObject newObj = zoneDataArray.createNestedObject();
+        for (JsonPair pair : obj) {
+          newObj[pair.key()] = pair.value();
+        }
+      }
+    }
+    file.close();
+  }
+
+  // Write back to file
+  file = SPIFFS.open("/zone_data.json", FILE_WRITE);
+  if (!file) {
+    return false;
+  }
+
+  if (serializeJson(doc, file) == 0) {
+    file.close();
+    return false;
+  }
+
+  file.close();
+  return true;
+}
+
+bool AlarmScheduler::loadZoneDataForAlarm(uint8_t callbackId, uint8_t alarmId, JsonObject& zoneData) {
+  if (!spiffsInitialized) {
+    return false;
+  }
+
+  File file = SPIFFS.open("/zone_data.json", FILE_READ);
+  if (!file) {
+    return false;
+  }
+
+  DynamicJsonDocument doc(8192);
+  DeserializationError error = deserializeJson(doc, file);
+  file.close();
+
+  if (error) {
+    return false;
+  }
+
+  JsonArray zoneDataArray = doc["zone_data"].as<JsonArray>();
+  for (JsonObject obj : zoneDataArray) {
+    if (obj["callback"].as<int>() == callbackId && obj["id"].as<int>() == alarmId) {
+      JsonObject srcZoneData = obj["zone_data"].as<JsonObject>();
+      for (JsonPair pair : srcZoneData) {
+        zoneData[pair.key()] = pair.value();
+      }
+      return true;
+    }
+  }
+  return false;
+}
+
+bool AlarmScheduler::deleteZoneDataFromSpiffs(uint8_t callbackId, uint8_t alarmId) {
+  if (!spiffsInitialized) {
+    return false;
+  }
+
+  File file = SPIFFS.open("/zone_data.json", FILE_READ);
+  if (!file) {
+    return true; // No file means nothing to delete
+  }
+
+  DynamicJsonDocument doc(8192);
+  DeserializationError error = deserializeJson(doc, file);
+  file.close();
+
+  if (error) {
+    return false;
+  }
+
+  JsonArray zoneDataArray = doc["zone_data"].as<JsonArray>();
+  JsonArray newArray = doc.createNestedArray("new_zone_data");
+  
+  // Copy all entries except the one to delete
+  for (JsonObject obj : zoneDataArray) {
+    if (!(obj["callback"].as<int>() == callbackId && obj["id"].as<int>() == alarmId)) {
+      JsonObject newObj = newArray.createNestedObject();
+      for (JsonPair pair : obj) {
+        newObj[pair.key()] = pair.value();
+      }
+    }
+  }
+
+  // Replace the array
+  doc.remove("zone_data");
+  doc["zone_data"] = newArray;
+  doc.remove("new_zone_data");
+
+  // Write back to file
+  file = SPIFFS.open("/zone_data.json", FILE_WRITE);
+  if (!file) {
+    return false;
+  }
+
+  if (serializeJson(doc, file) == 0) {
+    file.close();
+    return false;
+  }
+
+  file.close();
+  return true;
 }
 
 bool AlarmScheduler::saveAlarmsToSpiffs() {

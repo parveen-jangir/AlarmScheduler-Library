@@ -10,11 +10,11 @@
 #include <WiFiUdp.h>
 #include <SPIFFS.h>
 
-class CallbackAlarms
+class ZoneAlarms
 {
 private:
-  uint8_t callbackId;                                        // 1–4
-  void (*Callback)(int id, bool isOn, JsonObject &zoneData); // Updated callback signature
+  uint8_t zoneId;                                        // 1–4
+  void (*Zone)(int id, String _action, JsonObject &zoneData); // Updated zone signature
   struct Alarm
   {
     bool isActive;    // true if enabled
@@ -26,27 +26,27 @@ private:
     uint8_t date;     // 1–31
     uint8_t hour;     // 0–23
     uint8_t minute;   // 0–59
-    bool action;      // true=ON, false=OFF
+    String action;      // true=ON, false=OFF
   };
-  Alarm alarms[10];                // 10 alarms per callback
+  Alarm alarms[10];                // 10 alarms per zone
   uint8_t alarmCount;              // Active alarms (0–10)
   unsigned long lastTriggerMinute; // Debouncing (Unix minutes)
 
 public:
-  CallbackAlarms(uint8_t id);
+  ZoneAlarms(uint8_t id);
   bool addAlarm(JsonDocument &doc);
   bool deleteAlarm(uint8_t id);
   bool checkAlarms(); // Modified to accept scheduler reference
   void listAlarms(JsonArray &arr);
-  void setCallback(void (*callback)(int id, bool isOn, JsonObject &zoneData)) { Callback = callback; }
+  void setZone(void (*zone)(int id, String _action, JsonObject &zoneData)) { Zone = zone; }
   void clearAlarms();
-  bool hasCallback() const { return Callback != nullptr; }
+  bool hasZone() const { return Zone != nullptr; }
 };
 
 class AlarmScheduler
 {
 private:
-  CallbackAlarms callbacks[4]; // IDs 1–4
+  ZoneAlarms zones[4]; // IDs 1–4
   RtcDS1302<ThreeWire> *rtc;   // Pointer to RTC
   ThreeWire *wire;             // Pointer to ThreeWire
   WiFiUDP *ntpUDP;             // Pointer to NTP UDP
@@ -61,7 +61,7 @@ public:
   AlarmScheduler(unsigned long timeOffset = 19800);
   ~AlarmScheduler();
   void begin(uint8_t rstPin, uint8_t datPin, uint8_t clkPin);
-  void registerCallback(uint8_t id, void (*callback)(int id, bool isOn, JsonObject &zoneData));
+  void registerZone(uint8_t id, void (*zone)(int id, String _action, JsonObject &zoneData));
   void processJson(String &json);
   void checkAlarms();
   String printTime();
@@ -72,8 +72,8 @@ public:
   bool loadAlarmsFromSpiffs();
 
   bool saveZoneDataToSpiffs();
-  bool loadZoneDataForAlarm(uint8_t callbackId, uint8_t alarmId, JsonObject &zoneData);
-  bool deleteZoneDataFromSpiffs(uint8_t callbackId, uint8_t alarmId);
+  bool loadZoneDataForAlarm(uint8_t zoneId, uint8_t alarmId, JsonObject &zoneData);
+  bool deleteZoneDataFromSpiffs(uint8_t zoneId, uint8_t alarmId);
 };
 
 #endif
